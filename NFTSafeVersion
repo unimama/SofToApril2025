@@ -1,0 +1,795 @@
+/// @notice Helper function to convert strings to bytes32 for gas optimization
+    /// @param source The string to convert
+    /// @return result The bytes32 representation
+    function stringToBytes32(string memory source) internal pure returns (bytes32 result) {
+        bytes memory tempEmptyStringTest = bytes(source);
+        if (tempEmptyStringTest.length == 0) {
+            return 0x0;
+        }
+        
+        assembly {
+            result := mload(add(source, 32))
+        }
+    }    /// @notice Grants the autonomous role to an agent
+    /// @param _agent The address to grant the role to
+    function grantAutonomousRole(address _agent) external onlyRole(ADMIN_ROLE) {
+        _grantRole(AUTONOMOUS_ROLE, _agent);
+    }    // Events
+    event BeadCreated(string indexed beadId, string sku);
+    event BeadPreMinted(string indexed beadId, string uri, uint256 timestamp);
+    event BeadMinted(string indexed beadId, uint256 indexed tokenId, address indexed owner);
+    event BeadURIUpdated(string indexed beadId, uint256 indexed tokenId, string newUri, address indexed updater);
+    event OracleUpdated(address indexed newOracle);
+    event MetadataValidationRequested(bytes32 indexed requestId, string beadId, string uri);
+    event MetadataValidationSucceeded(string indexed beadId, string validatedUri);
+    event Paused();
+    event Unpaused();
+    event PausedFor(uint256 duration);
+    event RepositoryMappingSet(string indexed beadId, string web2Repository, string ipfsHash);
+    event QueryFeeSet(uint256 newFee);
+    event BDCTokenSet(address indexed newToken);
+    event ShopifyBackendSet(address indexed backend, bool authorized);
+    event AuthorizedViewer(address indexed viewer, bool status);
+    event Web2ControllerChanged(address indexed newController);// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.19;
+
+import "@chainlink/contracts/src/v0.8/VRFConsumerBase.sol";
+import "@chainlink/contracts/src/v0.8/ChainlinkClient.sol";
+import "@openzeppelin/contracts/token/ERC721/ERC721.sol";
+import "@openzeppelin/contracts/access/AccessControl.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+
+/// @title BeadSystem - A system for managing digital jewelry beads and their associated NFTs
+/// @notice This contract handles the creation, minting, and management of bead NFTs
+/// @dev Integrates with Chainlink VRF for random bead ID generation and oracle services
+contract BeadSystem is ERC721, VRFConsumerBase, ChainlinkClient, AccessControl, ReentrancyGuard {
+    // Access roles
+    bytes32 public constant ORACLE_ROLE = keccak256("ORACLE_ROLE");         // For Chainlink Oracle interactions
+    bytes32 public constant AUTONOMOUS_ROLE = keccak256("AUTONOMOUS_ROLE");  // For automated system operations
+    bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");           // For administrative operations
+    bytes32 public constant SHOPIFY_ROLE = keccak256("SHOPIFY_ROLE");       // For Shopify backend operations
+    bytes32 public constant MULTISIG_ROLE = keccak256("MULTISIG_ROLE");     // For critical security operations
+    
+    using Chainlink for Chainlink.Request;
+    
+    // VRF
+    bytes32 internal vrfKeyHash;
+    uint256 internal vrfFee;
+    
+    // Oracle
+    address public metadataOracle;
+    bytes32 public metadataJobId;
+    uint256 public metadataFee;
+    
+    // BDC Token and Fees
+    address public bdcToken;
+    uint256 public queryFee;
+    
+    // Circuit Breaker
+    uint256 public pauseEndTime;
+    
+    // Bead data structures
+    struct Bead {
+        string beadId;
+        string[] uris;
+        uint256 preMintDate;
+        string sku;
+    }
+    
+    struct RepositoryMapping {
+        string web2Repository;
+        string ipfsHash;
+        bool exists;
+    }
+    
+    mapping(string => Bead) private beads;
+    mapping(string => bool) private beadExists;
+    mapping(uint256 => string) private tokenIdToBeadId;
+    mapping(string => uint256) private beadIdToTokenId;
+    mapping(bytes32 => string) public skuForRequestId;
+    mapping(bytes32 => RequestInfo) private metadataRequests;
+    mapping(string => RepositoryMapping) private beadRepositories;
+
+    mapping(address => bool) public authorizedShopifyBackends;
+    
+    string[] private beadList;
+    uint256 private totalMinted;
+    bool public paused;
+    
+    struct RequestInfo {
+        string beadId;
+        string expectedUri;
+        address requester;
+    }
+    
+    // Privacy control for token URIs
+    mapping(uint256 => string) private tokenEncryptionKeys;
+    mapping(address => bool) private authorizedViewers;
+    address public web2Controller;
+    
+    // Events for authorization
+    event AuthorizedViewer(address viewer, bool status);
+    event Web2ControllerChanged(address indexed newController);
+    
+    // Modifiers
+    modifier whenNotPaused() {
+        if (paused && block.timestamp >= pauseEndTime) {
+            paused = false;
+            emit Unpaused();
+        }
+        require(!paused, "Contract is paused");
+        _;
+    }
+    
+    modifier onlyShopifyBackend() {
+        require(authorizedShopifyBackends[msg.sender] || hasRole(SHOPIFY_ROLE, msg.sender), 
+                "Not authorized Shopify backend");
+        _;
+    }
+    
+    constructor(
+        address _vrfCoordinator,
+        address _linkToken,
+        bytes32 _vrfKeyHash,
+        uint256 _vrfFee,
+        address _metadataOracle,
+        bytes32 _metadataJobId,
+        uint256 _metadataFee,
+        address _multisig,
+        address _bdcToken,
+        address _shopifyBackend,
+        address _web2Controller
+    ) ERC721("BeadNFT", "BEAD") VRFConsumerBase(_vrfCoordinator, _linkToken) {
+        setChainlinkToken(_linkToken);
+        
+        vrfKeyHash = _vrfKeyHash;
+        vrfFee = _vrfFee;
+        
+        metadataOracle = _metadataOracle;
+        metadataJobId = _metadataJobId;
+        metadataFee = _metadataFee;
+        
+        bdcToken = _bdcToken;
+        queryFee = 1e18; // Default fee of 1 BDC token (adjust based on token decimals)
+        
+        web2Controller = _web2Controller;
+        authorizedViewers[_web2Controller] = true;
+        
+        // Set up role hierarchy with Gnosis multisig as the highest authority
+        _setupRole(DEFAULT_ADMIN_ROLE, _multisig);
+        _setupRole(MULTISIG_ROLE, _multisig);
+        _setupRole(ADMIN_ROLE, _multisig);
+        _setupRole(ORACLE_ROLE, _metadataOracle);
+        
+        // Set up Shopify backend with appropriate roles
+        if (_shopifyBackend != address(0)) {
+            _setupRole(SHOPIFY_ROLE, _shopifyBackend);
+            authorizedShopifyBackends[_shopifyBackend] = true;
+        }
+        
+        // Set up Web2 controller with admin role for managing privacy
+        if (_web2Controller != address(0)) {
+            _setupRole(ADMIN_ROLE, _web2Controller);
+        }
+        
+        // Set up deployer with autonomous role for initial setup
+        _setupRole(AUTONOMOUS_ROLE, msg.sender);
+    }
+    
+    // Admin functions
+    
+    /// @notice Sets a new metadata oracle address
+    /// @param _newOracle The address of the new oracle
+    function setMetadataOracle(address _newOracle) external onlyRole(ADMIN_ROLE) {
+        metadataOracle = _newOracle;
+        _revokeRole(ORACLE_ROLE, metadataOracle);
+        _grantRole(ORACLE_ROLE, _newOracle);
+        emit OracleUpdated(_newOracle);
+    }
+    
+    /// @notice Updates oracle parameters (address, job ID, and fee)
+    /// @param _newOracle The address of the new oracle
+    /// @param _newJobId The new job ID for the oracle
+    /// @param _newFee The new fee for oracle requests
+    function setOracleParams(address _newOracle, bytes32 _newJobId, uint256 _newFee) 
+        external 
+        onlyRole(ADMIN_ROLE) 
+    {
+        metadataOracle = _newOracle;
+        metadataJobId = _newJobId;
+        metadataFee = _newFee;
+        _revokeRole(ORACLE_ROLE, metadataOracle);
+        _grantRole(ORACLE_ROLE, _newOracle);
+        emit OracleUpdated(_newOracle);
+    }
+    
+    /// @notice Pauses the contract indefinitely - restricted to multisig wallet
+    function pause() external onlyRole(MULTISIG_ROLE) {
+        paused = true;
+        emit Paused();
+    }
+    
+    /// @notice Pauses the contract for a specific duration - restricted to multisig wallet
+    /// @param duration The duration (in seconds) for which the contract will be paused
+    function pauseFor(uint256 duration) external onlyRole(MULTISIG_ROLE) {
+        paused = true;
+        pauseEndTime = block.timestamp + duration;
+        emit PausedFor(duration);
+    }
+    
+    /// @notice Manually checks if the pause period has ended and unpauses if necessary
+    function checkAutomaticUnpause() external {
+        if (paused && block.timestamp >= pauseEndTime) {
+            paused = false;
+            emit Unpaused();
+        }
+    }
+    
+    /// @notice Manually unpauses the contract - restricted to multisig wallet
+    function unpause() external onlyRole(MULTISIG_ROLE) {
+        paused = false;
+        emit Unpaused();
+    }
+    
+    /// @notice Withdraws LINK tokens from the contract - restricted to multisig wallet
+    function withdrawLink() external onlyRole(MULTISIG_ROLE) {
+        LinkTokenInterface link = LinkTokenInterface(chainlinkTokenAddress());
+        require(link.transfer(msg.sender, link.balanceOf(address(this))), "Withdraw failed");
+    }
+    
+    /// @notice Sets a new Web2 controller address
+    /// @param _newController The address of the new Web2 controller
+    function setWeb2Controller(address _newController) external onlyRole(MULTISIG_ROLE) {
+        require(_newController != address(0), "Invalid controller address");
+        web2Controller = _newController;
+        authorizedViewers[_newController] = true;
+        _setupRole(ADMIN_ROLE, _newController);
+        emit Web2ControllerChanged(_newController);
+    }
+    
+    /// @notice Authorizes or deauthorizes an address to view private URIs
+    /// @param viewer The address to authorize or deauthorize
+    /// @param status True to authorize, false to deauthorize
+    function setAuthorizedViewer(address viewer, bool status) external onlyRole(ADMIN_ROLE) {
+        require(viewer != address(0), "Invalid address");
+        authorizedViewers[viewer] = status;
+        emit AuthorizedViewer(viewer, status);
+    }
+    
+    /// @notice Batch authorize or deauthorize multiple addresses to view private URIs
+    /// @param viewers Array of addresses to authorize or deauthorize
+    /// @param statuses Array of boolean statuses corresponding to each address
+    function batchSetAuthorizedViewers(address[] calldata viewers, bool[] calldata statuses) 
+        external 
+        onlyRole(ADMIN_ROLE) 
+    {
+        require(viewers.length == statuses.length, "Arrays must be same length");
+        for (uint256 i = 0; i < viewers.length; i++) {
+            require(viewers[i] != address(0), "Invalid address");
+            authorizedViewers[viewers[i]] = statuses[i];
+            emit AuthorizedViewer(viewers[i], statuses[i]);
+        }
+    }
+    
+    /// @notice Sets a Shopify backend as authorized or unauthorized
+    /// @param backend The Shopify backend address
+    /// @param authorized Whether the backend is authorized
+    function setShopifyBackend(address backend, bool authorized) external onlyRole(ADMIN_ROLE) {
+        authorizedShopifyBackends[backend] = authorized;
+        if (authorized) {
+            _grantRole(SHOPIFY_ROLE, backend);
+        } else {
+            _revokeRole(SHOPIFY_ROLE, backend);
+        }
+        emit ShopifyBackendSet(backend, authorized);
+    }
+    
+    /// @notice Sets the BDC token address
+    /// @param _bdcToken The address of the BDC token contract
+    function setBDCToken(address _bdcToken) external onlyRole(ADMIN_ROLE) {
+        bdcToken = _bdcToken;
+        emit BDCTokenSet(_bdcToken);
+    }
+    
+    /// @notice Sets the query fee for repository mapping queries
+    /// @param _queryFee The new query fee
+    function setQueryFee(uint256 _queryFee) external onlyRole(ADMIN_ROLE) {
+        queryFee = _queryFee;
+        emit QueryFeeSet(_queryFee);
+    }
+    
+
+    
+    // VRF functions
+    
+    /// @notice Requests a random bead ID for a product SKU
+    /// @param sku The product SKU
+    /// @return requestId The request ID for the random number
+    function requestBeadId(string memory sku) 
+        external 
+        whenNotPaused 
+        onlyRole(AUTONOMOUS_ROLE) 
+        returns (bytes32 requestId) 
+    {
+        require(LINK.balanceOf(address(this)) >= vrfFee, "Not enough LINK");
+        requestId = requestRandomness(vrfKeyHash, vrfFee);
+        skuForRequestId[requestId] = sku;
+    }
+    
+    /// @notice Callback function used by VRF Coordinator to return the random number
+    /// @param requestId The request ID for this randomness request
+    /// @param randomness The random number returned by the VRF oracle
+    function fulfillRandomness(bytes32 requestId, uint256 randomness) internal override {
+        bytes memory charset = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+        bytes memory beadIdBytes = new bytes(8);
+        for (uint256 i = 0; i < 8; i++) {
+            beadIdBytes[i] = charset[randomness % charset.length];
+            randomness /= charset.length;
+        }
+        string memory beadId = string(beadIdBytes);
+        
+        // Prevent infinite loops by limiting attempts
+        uint256 maxAttempts = 10;
+        uint256 attempts = 0;
+        while (beadExists[beadId] && attempts < maxAttempts) {
+            beadIdBytes[7] = charset[randomness % charset.length];
+            beadId = string(beadIdBytes);
+            randomness = uint256(keccak256(abi.encodePacked(randomness, attempts)));
+            attempts++;
+        }
+        require(!beadExists[beadId], "Failed to generate unique bead ID");
+        
+        beadExists[beadId] = true;
+        string memory sku = skuForRequestId[requestId];
+        beads[beadId] = Bead(beadId, new string[](0), 0, sku);
+        beadList.push(beadId);
+        emit BeadCreated(beadId, sku);
+    }
+    
+    // Metadata Oracle functions
+    
+    /// @notice Requests validation of a metadata URI for a bead
+    /// @param beadId The bead ID
+    /// @param uriToCheck The URI to validate
+    /// @return requestId The request ID for the oracle request
+    function requestMetadataValidation(string calldata beadId, string calldata uriToCheck) 
+        external 
+        whenNotPaused 
+        onlyRole(AUTONOMOUS_ROLE)
+        returns (bytes32 requestId) 
+    {
+        require(beadExists[beadId], "Bead ID does not exist");
+        
+        Chainlink.Request memory req = buildChainlinkRequest(
+            metadataJobId, 
+            address(this), 
+            this.fulfillMetadataCheck.selector
+        );
+        req.add("get", uriToCheck);
+        req.add("path", "status");
+        requestId = sendChainlinkRequestTo(metadataOracle, req, metadataFee);
+        metadataRequests[requestId] = RequestInfo(beadId, uriToCheck, msg.sender);
+        emit MetadataValidationRequested(requestId, beadId, uriToCheck);
+    }
+    
+    /// @notice Callback function used by the oracle to fulfill the metadata validation request
+    /// @param _requestId The request ID for this oracle request
+    /// @param _status The status returned by the oracle
+    function fulfillMetadataCheck(bytes32 _requestId, bytes32 _status) 
+        public 
+        recordChainlinkFulfillment(_requestId) 
+    {
+        RequestInfo memory info = metadataRequests[_requestId];
+        require(keccak256(abi.encodePacked(_status)) == keccak256(abi.encodePacked("valid")), "Invalid metadata");
+        
+        // Update URI internally
+        beads[info.beadId].uris.push(info.expectedUri);
+        
+        // Emit event if already minted
+        uint256 tokenId = beadIdToTokenId[info.beadId];
+        if (tokenId != 0) {
+            emit BeadURIUpdated(info.beadId, tokenId, info.expectedUri, metadataOracle);
+        }
+        
+        emit MetadataValidationSucceeded(info.beadId, info.expectedUri);
+    }
+    
+    // Repository mapping functions
+    
+    /// @notice Sets the repository mapping for a bead
+    /// @param beadId The bead ID
+    /// @param web2Repo The Web2 repository URL
+    /// @param ipfsHash The IPFS hash of the repository
+    function setRepositoryMapping(string memory beadId, string memory web2Repo, string memory ipfsHash) 
+        external 
+        onlyRole(AUTONOMOUS_ROLE) 
+    {
+        require(beadExists[beadId], "Bead ID does not exist");
+        beadRepositories[beadId] = RepositoryMapping(web2Repo, ipfsHash, true);
+        emit RepositoryMappingSet(beadId, web2Repo, ipfsHash);
+    }
+    
+    /// @notice Queries the repository mapping for a bead (free, admin only)
+    /// @param beadId The bead ID
+    /// @return web2Repo The Web2 repository URL
+    /// @return ipfsHash The IPFS hash of the repository
+    function queryRepositoryMapping(string memory beadId) 
+        external 
+        view 
+        onlyRole(ADMIN_ROLE)
+        returns (string memory web2Repo, string memory ipfsHash) 
+    {
+        require(beadRepositories[beadId].exists, "Repository mapping not found");
+        return (beadRepositories[beadId].web2Repository, beadRepositories[beadId].ipfsHash);
+    }
+    
+    /// @notice Shopify backend function to check if a user has enough BDC and process repository query payment
+    /// @param user The user's address who wants to query
+    /// @param beadId The bead ID to query
+    /// @return success Whether the payment was processed successfully
+    /// @return web2Repo The Web2 repository URL
+    /// @return ipfsHash The IPFS hash of the repository
+    function shopifyRepositoryQuery(address user, string memory beadId) 
+        external 
+        whenNotPaused
+        nonReentrant
+        onlyRole(SHOPIFY_ROLE)
+        returns (bool success, string memory web2Repo, string memory ipfsHash) 
+    {
+        require(bdcToken != address(0), "BDC token not set");
+        require(beadRepositories[beadId].exists, "Repository mapping not found");
+        
+        IERC20 token = IERC20(bdcToken);
+        if (token.balanceOf(user) >= queryFee && token.allowance(user, address(this)) >= queryFee) {
+            bool transferred = token.transferFrom(user, address(this), queryFee);
+            if (transferred) {
+                return (true, beadRepositories[beadId].web2Repository, beadRepositories[beadId].ipfsHash);
+            }
+        }
+        
+        return (false, "", "");
+    }
+    
+    // NFT functions
+    
+    /// @notice Pre-mints a bead with an initial URI
+    /// @param beadId The bead ID
+    /// @param uri The initial URI for the bead
+    function preMintBead(string memory beadId, string memory uri) 
+        external 
+        whenNotPaused 
+        onlyRole(AUTONOMOUS_ROLE) 
+    {
+        require(beadExists[beadId], "Bead ID does not exist");
+        require(beads[beadId].preMintDate == 0, "Bead already pre-minted");
+        beads[beadId].uris.push(uri);
+        beads[beadId].preMintDate = block.timestamp;
+        emit BeadPreMinted(beadId, uri, block.timestamp);
+    }
+    
+    /// @notice Mints a bead NFT - only accessible to Shopify backend or admin
+    /// @param beadId The bead ID to mint
+    /// @param recipient The address that will receive the NFT
+    /// @param accessKey Optional encryption key for private URI access
+    function mintBead(string memory beadId, address recipient, string memory accessKey) 
+        external 
+        whenNotPaused 
+        nonReentrant 
+        onlyRole(SHOPIFY_ROLE)
+    {
+        require(beadExists[beadId], "Bead ID does not exist");
+        require(beads[beadId].preMintDate > 0, "Bead must be pre-minted first");
+        require(beadIdToTokenId[beadId] == 0, "Bead already minted");
+        require(recipient != address(0), "Invalid recipient address");
+        
+        uint256 tokenId = totalMinted + 1; // Incremental token ID instead of hash
+        _mint(recipient, tokenId);
+        tokenIdToBeadId[tokenId] = beadId;
+        beadIdToTokenId[beadId] = tokenId;
+        
+        // Automatically authorize the token owner to view their own URIs
+        authorizedViewers[recipient] = true;
+        
+        // Store access key if provided
+        if (bytes(accessKey).length > 0) {
+            tokenEncryptionKeys[tokenId] = accessKey;
+        }
+        
+        totalMinted++;
+        emit BeadMinted(beadId, tokenId, recipient);
+    }
+    
+    // BDC Payment functions
+    
+    /// @notice Processes a payment with BDC tokens
+    /// @param amount The amount of BDC to transfer
+    /// @param recipient The recipient of the BDC tokens
+    function payWithBDC(uint256 amount, address recipient) 
+        external 
+        whenNotPaused 
+        nonReentrant 
+        onlyRole(AUTONOMOUS_ROLE) 
+    {
+        require(bdcToken != address(0), "BDC token not set");
+        IERC20 token = IERC20(bdcToken);
+        require(token.transferFrom(msg.sender, recipient, amount), "BDC payment failed");
+    }
+    
+    /// @notice Allows the multisig wallet to withdraw BDC tokens from the contract
+    /// @param amount The amount to withdraw
+    /// @param recipient The recipient of the tokens
+    function withdrawBDC(uint256 amount, address recipient) 
+        external 
+        onlyRole(MULTISIG_ROLE) 
+    {
+        require(bdcToken != address(0), "BDC token not set");
+        IERC20 token = IERC20(bdcToken);
+        require(token.transfer(recipient, amount), "BDC withdrawal failed");
+    }
+    
+    // Shopify integration functions
+    
+    /// @notice Allows Shopify backend to trigger bead creation and pre-minting in one call
+    /// @param sku The product SKU
+    /// @param requestId The VRF request ID returned by requestBeadId
+    /// @param beadId The bead ID generated by VRF
+    /// @param uri The initial URI for the bead
+    function shopifyCreateAndPreMint(
+        string memory sku, 
+        bytes32 requestId, 
+        string memory beadId, 
+        string memory uri
+    ) 
+        external 
+        whenNotPaused 
+        onlyShopifyBackend 
+    {
+        // Verify this is a valid bead ID from our system
+        require(keccak256(abi.encodePacked(skuForRequestId[requestId])) == keccak256(abi.encodePacked(sku)), 
+                "Invalid requestId or SKU");
+        require(beadExists[beadId], "Bead ID does not exist");
+        require(beads[beadId].preMintDate == 0, "Bead already pre-minted");
+        
+        // Pre-mint the bead
+        beads[beadId].uris.push(uri);
+        beads[beadId].preMintDate = block.timestamp;
+        emit BeadPreMinted(beadId, uri, block.timestamp);
+    }
+    
+    /// @notice Batch mints multiple beads - for efficiency with high volume
+    /// @param beadIds Array of bead IDs to mint
+    /// @param recipients Array of addresses to receive the NFTs
+    /// @param accessKeys Array of optional encryption keys for private URI access
+    function batchMintBeads(
+        string[] memory beadIds,
+        address[] memory recipients,
+        string[] memory accessKeys
+    )
+        external
+        whenNotPaused
+        nonReentrant
+        onlyRole(SHOPIFY_ROLE)
+    {
+        require(beadIds.length == recipients.length, "Arrays must be same length");
+        require(accessKeys.length == 0 || accessKeys.length == beadIds.length, "Invalid accessKeys length");
+        require(beadIds.length <= 50, "Batch too large"); // Gas limit protection
+        
+        for (uint256 i = 0; i < beadIds.length; i++) {
+            string memory beadId = beadIds[i];
+            address recipient = recipients[i];
+            
+            require(beadExists[beadId], "Bead ID does not exist");
+            require(beads[beadId].preMintDate > 0, "Bead must be pre-minted first");
+            require(beadIdToTokenId[beadId] == 0, "Bead already minted");
+            require(recipient != address(0), "Invalid recipient address");
+            
+            uint256 tokenId = totalMinted + 1;
+            _mint(recipient, tokenId);
+            tokenIdToBeadId[tokenId] = beadId;
+            beadIdToTokenId[beadId] = tokenId;
+            
+            // Automatically authorize the token owner to view their own URIs
+            authorizedViewers[recipient] = true;
+            
+            // Store access key if provided
+            if (accessKeys.length > 0 && bytes(accessKeys[i]).length > 0) {
+                tokenEncryptionKeys[tokenId] = accessKeys[i];
+            }
+            
+            totalMinted++;
+            emit BeadMinted(beadId, tokenId, recipient);
+        }
+    }
+    
+    /// @notice Allows Shopify backend to verify a user has enough BDC for a query
+    /// @param user The user's address
+    /// @return hasEnough Whether the user has enough BDC
+    function verifyBDCBalance(address user) 
+        external 
+        view 
+        onlyShopifyBackend 
+        returns (bool hasEnough) 
+    {
+        if (bdcToken == address(0)) return false;
+        IERC20 token = IERC20(bdcToken);
+        return token.balanceOf(user) >= queryFee && 
+               token.allowance(user, address(this)) >= queryFee;
+    }
+    
+    // Override functions
+    
+    /// @notice Returns the URI for a token ID with privacy controls
+    /// @param tokenId The token ID
+    /// @return Either the real URI if caller is authorized or a placeholder URI
+    function tokenURI(uint256 tokenId) public view override returns (string memory) {
+        require(_exists(tokenId), "Token does not exist");
+        
+        // Check if the caller is authorized to view this URI
+        if (authorizedViewers[msg.sender] || 
+            msg.sender == ownerOf(tokenId) || 
+            msg.sender == web2Controller) {
+            
+            string memory beadId = tokenIdToBeadId[tokenId];
+            string[] memory uris = beads[beadId].uris;
+            require(uris.length > 0, "No URI available");
+            return uris[uris.length - 1];
+        } else {
+            // Return a placeholder URI for unauthorized viewers
+            return string(abi.encodePacked(
+                "https://", 
+                toAsciiString(web2Controller),
+                ".web/placeholder/",
+                toString(tokenId)
+            ));
+        }
+    }
+    
+    /// @notice Gets the real URI for a token with proper authorization
+    /// @param tokenId The token ID
+    /// @param accessKey The access key for the token (optional)
+    /// @return The real URI if authorized
+    function getPrivateTokenURI(uint256 tokenId, string memory accessKey) 
+        external 
+        view 
+        returns (string memory) 
+    {
+        require(_exists(tokenId), "Token does not exist");
+        
+        // Check if the caller is the token owner or an authorized viewer
+        bool isOwner = msg.sender == ownerOf(tokenId);
+        bool isAuthorized = authorizedViewers[msg.sender] || msg.sender == web2Controller;
+        
+        // If an access key is required and provided, validate it
+        bool hasValidKey = false;
+        if (bytes(tokenEncryptionKeys[tokenId]).length > 0) {
+            hasValidKey = keccak256(abi.encodePacked(accessKey)) == 
+                          keccak256(abi.encodePacked(tokenEncryptionKeys[tokenId]));
+        }
+        
+        require(isOwner || isAuthorized || hasValidKey, "Not authorized to view this URI");
+        
+        string memory beadId = tokenIdToBeadId[tokenId];
+        string[] memory uris = beads[beadId].uris;
+        require(uris.length > 0, "No URI available");
+        return uris[uris.length - 1];
+    }
+    
+    /// @notice Web2 controller function to generate a signed access URL
+    /// @param tokenId The token ID
+    /// @param expiration Timestamp when the access expires
+    /// @return signedUrl The signed access URL for the Web2 frontend
+    function generateSignedAccessURL(uint256 tokenId, uint256 expiration)
+        external
+        view
+        onlyRole(ADMIN_ROLE)
+        returns (string memory signedUrl)
+    {
+        require(_exists(tokenId), "Token does not exist");
+        string memory beadId = tokenIdToBeadId[tokenId];
+        string memory baseUrl = beads[beadId].uris[beads[beadId].uris.length - 1];
+        
+        // Create a signature-like parameter using a hash of token + expiration
+        bytes32 signature = keccak256(abi.encodePacked(tokenId, expiration, web2Controller));
+        
+        // Return URL with auth parameters
+        return string(abi.encodePacked(
+            baseUrl,
+            "?token=",
+            toString(tokenId),
+            "&exp=",
+            toString(expiration),
+            "&sig=",
+            toHexString(uint256(signature))
+        ));
+    }
+    
+    // View functions
+    
+    /// @notice Returns a bead's information
+    /// @param beadId The bead ID
+    /// @return The bead struct
+    function getBead(string memory beadId) external view returns (Bead memory) {
+        require(beadExists[beadId], "Bead ID does not exist");
+        return beads[beadId];
+    }
+    
+    /// @notice Returns the bead ID associated with a token ID
+    /// @param tokenId The token ID
+    /// @return The bead ID
+    function getBeadIdByTokenId(uint256 tokenId) external view returns (string memory) {
+        return tokenIdToBeadId[tokenId];
+    }
+    
+    /// @notice Returns all URIs associated with a bead
+    /// @param beadId The bead ID
+    /// @return An array of URIs
+    function getBeadURIs(string memory beadId) external view returns (string[] memory) {
+        require(beadExists[beadId], "Bead ID does not exist");
+        return beads[beadId].uris;
+    }
+    
+    /// @notice Returns the total number of minted tokens
+    /// @return The total supply
+    function totalSupply() external view returns (uint256) {
+        return totalMinted;
+    }
+    
+    /// @notice Helper function to convert address to ASCII string
+    /// @param addr The address to convert
+    /// @return The ASCII string representation
+    function toAsciiString(address addr) internal pure returns (string memory) {
+        bytes memory addressBytes = abi.encodePacked(addr);
+        bytes memory result = new bytes(40);
+        
+        for (uint256 i = 0; i < 20; i++) {
+            bytes1 value = addressBytes[i];
+            bytes1 hi = bytes1(uint8(value) / 16);
+            bytes1 lo = bytes1(uint8(value) - 16 * uint8(hi));
+            hi = hi < bytes1(10) ? bytes1(uint8(hi) + 48) : bytes1(uint8(hi) + 87);
+            lo = lo < bytes1(10) ? bytes1(uint8(lo) + 48) : bytes1(uint8(lo) + 87);
+            result[i*2] = hi;
+            result[i*2+1] = lo;
+        }
+        
+        return string(result);
+    }
+    
+    /// @notice Helper function to convert uint to string
+    /// @param value The uint to convert
+    /// @return The string representation
+    function toString(uint256 value) internal pure returns (string memory) {
+        if (value == 0) {
+            return "0";
+        }
+        
+        uint256 temp = value;
+        uint256 digits;
+        
+        while (temp != 0) {
+            digits++;
+            temp /= 10;
+        }
+        
+        bytes memory buffer = new bytes(digits);
+        while (value != 0) {
+            digits -= 1;
+            buffer[digits] = bytes1(uint8(48 + uint256(value % 10)));
+            value /= 10;
+        }
+        
+        return string(buffer);
+    }
+    
+    /// @notice Helper function to convert bytes32 to hex string
+    /// @param value The bytes32 to convert
+    /// @return The hex string representation
+    function toHexString(uint256 value) internal pure returns (string memory) {
+        bytes memory buffer = new bytes(64);
+        for (uint256 i = 0; i < 32; i++) {
+            buffer[i*2] = bytes1(uint8(value / (2**(255-i*8)) % 16 + (value / (2**(255-i*8)) % 16 < 10 ? 48 : 87)));
+            buffer[i*2+1] = bytes1(uint8(value / (2**(251-i*8)) % 16 + (value / (2**(251-i*8)) % 16 < 10 ? 48 : 87)));
+        }
+        return string(buffer);
+    }
+}
