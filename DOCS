@@ -1,623 +1,161 @@
 # BeadSystem Smart Contract Documentation
 
 ## Overview
+**Contract Name:** `BeadSystem`
 
-The BeadSystem smart contract manages digital jewelry beads with NFT capabilities, integrating with Shopify as a frontend. It features Chainlink VRF for random ID generation, privacy controls for NFT content, and role-based access management.
+BeadSystem is a robust, gas-optimized smart contract for managing digital jewelry beads as NFTs. It includes features such as role-based access control, integration with Chainlink VRF and Oracle services, Shopify backend support, privacy-preserving URI handling, and Web2-IPFS repository mapping.
 
-## Access Roles
+---
 
-The contract uses role-based access control with five distinct roles:
+## Table of Contents
+1. [Roles](#roles)
+2. [Events](#events)
+3. [Structs](#structs)
+4. [Mappings](#mappings)
+5. [Modifiers](#modifiers)
+6. [Constructor](#constructor)
+7. [Admin Functions](#admin-functions)
+8. [VRF Functions](#vrf-functions)
+9. [Metadata Oracle Functions](#metadata-oracle-functions)
+10. [Repository Mapping Functions](#repository-mapping-functions)
+11. [NFT Functions](#nft-functions)
+12. [BDC Payment Functions](#bdc-payment-functions)
+13. [Shopify Integration](#shopify-integration)
+14. [Utility & View Functions](#utility--view-functions)
 
-- **MULTISIG_ROLE**: Reserved for the Gnosis multisig wallet for critical operations
-- **ADMIN_ROLE**: Administrative operations
-- **SHOPIFY_ROLE**: Shopify backend operations
-- **AUTONOMOUS_ROLE**: Automated system operations
-- **ORACLE_ROLE**: For Chainlink Oracle interactions
+---
 
-## Core Structures and Variables
+## Roles
+- `ADMIN_ROLE`: General administrative control
+- `MULTISIG_ROLE`: Critical ops and emergency control
+- `ORACLE_ROLE`: Chainlink Oracle operations
+- `AUTONOMOUS_ROLE`: Automation and internal ops
+- `SHOPIFY_ROLE`: Shopify backend integration
 
-### Main Data Structures
+---
 
-```solidity
-struct Bead {
-    string beadId;
-    string[] uris;
-    uint256 preMintDate;
-    string sku;
-}
+## Events
+- `BeadCreated(beadId, sku)`
+- `BeadPreMinted(beadId, uri, timestamp)`
+- `BeadMinted(beadId, tokenId, owner)`
+- `BeadURIUpdated(beadId, tokenId, newUri, updater)`
+- `OracleUpdated(newOracle)`
+- `MetadataValidationRequested(requestId, beadId, uri)`
+- `MetadataValidationSucceeded(beadId, validatedUri)`
+- `Paused()` / `Unpaused()` / `PausedFor(duration)`
+- `RepositoryMappingSet(beadId, web2Repo, ipfsHash)`
+- `QueryFeeSet(newFee)`
+- `BDCTokenSet(newToken)`
+- `ShopifyBackendSet(backend, authorized)`
+- `AuthorizedViewer(viewer, status)`
+- `Web2ControllerChanged(newController)`
 
-struct RepositoryMapping {
-    string web2Repository;
-    string ipfsHash;
-    bool exists;
-}
+---
 
-struct RequestInfo {
-    string beadId;
-    string expectedUri;
-    address requester;
-}
-```
+## Structs
+- `Bead`: Bead metadata and URIs
+- `RepositoryMapping`: Links Web2 repo with IPFS
+- `RequestInfo`: Metadata validation info
 
-### Privacy Control Variables
+---
 
-```solidity
-mapping(uint256 => string) private tokenEncryptionKeys;
-mapping(address => bool) private authorizedViewers;
-address public web2Controller;
-```
+## Mappings
+- `beads[beadId]`: Maps bead ID to Bead struct
+- `beadExists[beadId]`: Tracks unique bead IDs
+- `tokenIdToBeadId[tokenId]`: Links NFTs to bead IDs
+- `beadIdToTokenId[beadId]`: Reverse mapping
+- `metadataRequests[requestId]`: Oracle validation requests
+- `skuForRequestId[requestId]`: VRF bead generation
+- `authorizedShopifyBackends[address]`: Permissions
+- `authorizedViewers[address]`: Private access control
+- `tokenEncryptionKeys[tokenId]`: Encryption for URIs
 
-## Initialization Functions
+---
 
-### Constructor
+## Modifiers
+- `whenNotPaused`: Validates operational status
+- `onlyShopifyBackend`: Restricts Shopify functions
 
-```solidity
-constructor(
-    address _vrfCoordinator,
-    address _linkToken,
-    bytes32 _vrfKeyHash,
-    uint256 _vrfFee,
-    address _metadataOracle,
-    bytes32 _metadataJobId,
-    uint256 _metadataFee,
-    address _multisig,
-    address _bdcToken,
-    address _shopifyBackend,
-    address _web2Controller
-)
-```
+---
 
-**Purpose**: Initializes the contract with all required parameters.
+## Constructor
+Initializes the contract, sets VRF and Oracle parameters, and assigns roles to multisig, Shopify backend, and Web2 controller.
 
-**Parameters**:
-- `_vrfCoordinator`: Chainlink VRF coordinator address
-- `_linkToken`: LINK token address
-- `_vrfKeyHash`: Chainlink VRF key hash
-- `_vrfFee`: Chainlink VRF fee amount
-- `_metadataOracle`: Chainlink oracle address for metadata validation
-- `_metadataJobId`: Job ID for the Chainlink oracle
-- `_metadataFee`: Fee for oracle requests
-- `_multisig`: Gnosis multisig wallet address
-- `_bdcToken`: BDC token address
-- `_shopifyBackend`: Shopify backend address
-- `_web2Controller`: Web2 controller address for privacy management
-
-**Access**: Called only during contract deployment.
+---
 
 ## Admin Functions
-
-### setMetadataOracle
-
-```solidity
-function setMetadataOracle(address _newOracle) external onlyRole(ADMIN_ROLE)
-```
-
-**Purpose**: Updates the metadata oracle address.
-
-**Parameters**:
-- `_newOracle`: The new oracle address
-
-**Access**: ADMIN_ROLE
-
-### setOracleParams
-
-```solidity
-function setOracleParams(address _newOracle, bytes32 _newJobId, uint256 _newFee) external onlyRole(ADMIN_ROLE)
-```
-
-**Purpose**: Updates all oracle parameters at once.
-
-**Parameters**:
-- `_newOracle`: The new oracle address
-- `_newJobId`: The new oracle job ID
-- `_newFee`: The new oracle fee
-
-**Access**: ADMIN_ROLE
-
-### setShopifyBackend
-
-```solidity
-function setShopifyBackend(address backend, bool authorized) external onlyRole(ADMIN_ROLE)
-```
-
-**Purpose**: Authorizes or deauthorizes a Shopify backend address.
-
-**Parameters**:
-- `backend`: The Shopify backend address
-- `authorized`: Whether to authorize or deauthorize
-
-**Access**: ADMIN_ROLE
-
-### setBDCToken
-
-```solidity
-function setBDCToken(address _bdcToken) external onlyRole(ADMIN_ROLE)
-```
-
-**Purpose**: Sets or updates the BDC token address.
-
-**Parameters**:
-- `_bdcToken`: The BDC token address
-
-**Access**: ADMIN_ROLE
-
-### setQueryFee
-
-```solidity
-function setQueryFee(uint256 _queryFee) external onlyRole(ADMIN_ROLE)
-```
-
-**Purpose**: Sets the fee for repository queries.
-
-**Parameters**:
-- `_queryFee`: The new query fee
-
-**Access**: ADMIN_ROLE
-
-### grantAutonomousRole
-
-```solidity
-function grantAutonomousRole(address _agent) external onlyRole(ADMIN_ROLE)
-```
-
-**Purpose**: Grants the autonomous role to an agent.
-
-**Parameters**:
-- `_agent`: The address to grant the role to
-
-**Access**: ADMIN_ROLE
-
-## Security Functions (Multisig Only)
-
-### pause
-
-```solidity
-function pause() external onlyRole(MULTISIG_ROLE)
-```
-
-**Purpose**: Pauses the contract indefinitely.
-
-**Access**: MULTISIG_ROLE
-
-### pauseFor
-
-```solidity
-function pauseFor(uint256 duration) external onlyRole(MULTISIG_ROLE)
-```
-
-**Purpose**: Pauses the contract for a specific duration.
-
-**Parameters**:
-- `duration`: The duration in seconds
-
-**Access**: MULTISIG_ROLE
-
-### unpause
-
-```solidity
-function unpause() external onlyRole(MULTISIG_ROLE)
-```
-
-**Purpose**: Manually unpauses the contract.
-
-**Access**: MULTISIG_ROLE
-
-### checkAutomaticUnpause
-
-```solidity
-function checkAutomaticUnpause() external
-```
-
-**Purpose**: Checks if the pause period has ended and unpauses if necessary.
-
-**Access**: Anyone
-
-### withdrawLink
-
-```solidity
-function withdrawLink() external onlyRole(MULTISIG_ROLE)
-```
-
-**Purpose**: Withdraws LINK tokens from the contract.
-
-**Access**: MULTISIG_ROLE
-
-### withdrawBDC
-
-```solidity
-function withdrawBDC(uint256 amount, address recipient) external onlyRole(MULTISIG_ROLE)
-```
-
-**Purpose**: Withdraws BDC tokens from the contract.
-
-**Parameters**:
-- `amount`: The amount to withdraw
-- `recipient`: The recipient address
-
-**Access**: MULTISIG_ROLE
-
-## Privacy Control Functions
-
-### setWeb2Controller
-
-```solidity
-function setWeb2Controller(address _newController) external onlyRole(MULTISIG_ROLE)
-```
-
-**Purpose**: Sets a new Web2 controller address for privacy management.
-
-**Parameters**:
-- `_newController`: The new controller address
-
-**Access**: MULTISIG_ROLE
-
-### setAuthorizedViewer
-
-```solidity
-function setAuthorizedViewer(address viewer, bool status) external onlyRole(ADMIN_ROLE)
-```
-
-**Purpose**: Authorizes or deauthorizes an address to view private URIs.
-
-**Parameters**:
-- `viewer`: The address to authorize/deauthorize
-- `status`: True to authorize, false to deauthorize
-
-**Access**: ADMIN_ROLE
-
-### batchSetAuthorizedViewers
-
-```solidity
-function batchSetAuthorizedViewers(address[] calldata viewers, bool[] calldata statuses) external onlyRole(ADMIN_ROLE)
-```
-
-**Purpose**: Batch authorizes or deauthorizes multiple addresses.
-
-**Parameters**:
-- `viewers`: Array of addresses
-- `statuses`: Array of boolean statuses
-
-**Access**: ADMIN_ROLE
-
-## Bead Creation Functions
-
-### requestBeadId
-
-```solidity
-function requestBeadId(string memory sku) external whenNotPaused onlyRole(AUTONOMOUS_ROLE) returns (bytes32 requestId)
-```
-
-**Purpose**: Requests a random bead ID for a product SKU using Chainlink VRF.
-
-**Parameters**:
-- `sku`: The product SKU
-
-**Returns**: The VRF request ID
-
-**Access**: AUTONOMOUS_ROLE
-
-### fulfillRandomness
-
-```solidity
-function fulfillRandomness(bytes32 requestId, uint256 randomness) internal override
-```
-
-**Purpose**: Callback function that receives the random number and generates the bead ID.
-
-**Parameters**:
-- `requestId`: The VRF request ID
-- `randomness`: The random number
-
-**Access**: Internal, called by Chainlink VRF
-
-## Metadata Functions
-
-### requestMetadataValidation
-
-```solidity
-function requestMetadataValidation(string calldata beadId, string calldata uriToCheck) external whenNotPaused onlyRole(AUTONOMOUS_ROLE) returns (bytes32 requestId)
-```
-
-**Purpose**: Requests validation of a metadata URI for a bead.
-
-**Parameters**:
-- `beadId`: The bead ID
-- `uriToCheck`: The URI to validate
-
-**Returns**: The oracle request ID
-
-**Access**: AUTONOMOUS_ROLE
-
-### fulfillMetadataCheck
-
-```solidity
-function fulfillMetadataCheck(bytes32 _requestId, bytes32 _status) public recordChainlinkFulfillment(_requestId)
-```
-
-**Purpose**: Callback function that processes the metadata validation result.
-
-**Parameters**:
-- `_requestId`: The request ID
-- `_status`: The validation status
-
-**Access**: Public, called by Chainlink Oracle
+- `setMetadataOracle(address)`
+- `setOracleParams(address, bytes32, uint256)`
+- `pause()` / `pauseFor(uint256)` / `checkAutomaticUnpause()` / `unpause()`
+- `withdrawLink()` / `withdrawBDC(uint256, address)`
+- `setWeb2Controller(address)`
+- `setAuthorizedViewer(address, bool)` / `batchSetAuthorizedViewers(address[], bool[])`
+- `setShopifyBackend(address, bool)`
+- `setBDCToken(address)` / `setQueryFee(uint256)`
+
+---
+
+## VRF Functions
+- `requestBeadId(string sku)` → Returns Chainlink VRF request ID
+- `fulfillRandomness(bytes32, uint256)` → VRF callback for generating bead ID
+
+---
+
+## Metadata Oracle Functions
+- `requestMetadataValidation(beadId, uriToCheck)`
+- `fulfillMetadataCheck(requestId, status)` → Oracle callback
+
+---
 
 ## Repository Mapping Functions
+- `setRepositoryMapping(beadId, web2Repo, ipfsHash)`
+- `queryRepositoryMapping(beadId)`
+- `shopifyRepositoryQuery(user, beadId)`
 
-### setRepositoryMapping
+---
 
-```solidity
-function setRepositoryMapping(string memory beadId, string memory web2Repo, string memory ipfsHash) external onlyRole(AUTONOMOUS_ROLE)
-```
+## NFT Functions
+- `preMintBead(beadId, uri)`
+- `mintBead(beadId, recipient, accessKey)`
+- `batchMintBeads(beadIds[], recipients[], accessKeys[])`
 
-**Purpose**: Sets the mapping between a bead ID, Web2 repository, and IPFS hash.
+---
 
-**Parameters**:
-- `beadId`: The bead ID
-- `web2Repo`: The Web2 repository URL
-- `ipfsHash`: The IPFS hash
+## BDC Payment Functions
+- `payWithBDC(amount, recipient)`
+- `verifyBDCBalance(user)`
 
-**Access**: AUTONOMOUS_ROLE
+---
 
-### queryRepositoryMapping
+## Shopify Integration
+- `shopifyCreateAndPreMint(sku, requestId, beadId, uri)`
+- `batchMintBeads(...)`
 
-```solidity
-function queryRepositoryMapping(string memory beadId) external view onlyRole(ADMIN_ROLE) returns (string memory web2Repo, string memory ipfsHash)
-```
+---
 
-**Purpose**: Allows admins to query repository mappings without payment.
+## Utility & View Functions
+- `tokenURI(tokenId)` → Returns private/placeholder URI
+- `getPrivateTokenURI(tokenId, accessKey)`
+- `generateSignedAccessURL(tokenId, expiration)`
+- `getBead(beadId)`
+- `getBeadIdByTokenId(tokenId)`
+- `getBeadURIs(beadId)`
+- `totalSupply()`
 
-**Parameters**:
-- `beadId`: The bead ID
+### Helpers
+- `stringToBytes32(string)` → Efficient conversion
+- `toAsciiString(address)`
+- `toString(uint256)`
+- `toHexString(uint256)`
 
-**Returns**: Web2 repository URL and IPFS hash
+---
 
-**Access**: ADMIN_ROLE
+## Notes
+- **Security:** Role-based controls and reentrancy protection
+- **Gas Optimization:** bytes32 usage and efficient data access
+- **Extensibility:** Modular design with well-separated concerns
+- **Privacy:** Token URI visibility gated by ownership, encryption, and roles
 
-### shopifyRepositoryQuery
+---
 
-```solidity
-function shopifyRepositoryQuery(address user, string memory beadId) external whenNotPaused nonReentrant onlyRole(SHOPIFY_ROLE) returns (bool success, string memory web2Repo, string memory ipfsHash)
-```
-
-**Purpose**: Allows Shopify to process a paid repository query for a customer.
-
-**Parameters**:
-- `user`: The customer's address
-- `beadId`: The bead ID
-
-**Returns**: Success status, Web2 repository URL, and IPFS hash
-
-**Access**: SHOPIFY_ROLE
-
-## NFT Minting Functions
-
-### preMintBead
-
-```solidity
-function preMintBead(string memory beadId, string memory uri) external whenNotPaused onlyRole(AUTONOMOUS_ROLE)
-```
-
-**Purpose**: Pre-mints a bead with initial metadata before actual NFT minting.
-
-**Parameters**:
-- `beadId`: The bead ID
-- `uri`: The initial URI
-
-**Access**: AUTONOMOUS_ROLE
-
-### mintBead
-
-```solidity
-function mintBead(string memory beadId, address recipient, string memory accessKey) external whenNotPaused nonReentrant onlyRole(SHOPIFY_ROLE)
-```
-
-**Purpose**: Mints a bead NFT to a specific recipient with optional privacy access key.
-
-**Parameters**:
-- `beadId`: The bead ID
-- `recipient`: The recipient's address
-- `accessKey`: Optional encryption key for private URI access
-
-**Access**: SHOPIFY_ROLE
-
-### batchMintBeads
-
-```solidity
-function batchMintBeads(string[] memory beadIds, address[] memory recipients, string[] memory accessKeys) external whenNotPaused nonReentrant onlyRole(SHOPIFY_ROLE)
-```
-
-**Purpose**: Mints multiple bead NFTs in a single transaction with optional privacy access keys.
-
-**Parameters**:
-- `beadIds`: Array of bead IDs
-- `recipients`: Array of recipient addresses
-- `accessKeys`: Array of optional encryption keys
-
-**Access**: SHOPIFY_ROLE
-
-## URI Access Functions
-
-### tokenURI
-
-```solidity
-function tokenURI(uint256 tokenId) public view override returns (string memory)
-```
-
-**Purpose**: Returns the URI for a token ID with privacy controls.
-
-**Parameters**:
-- `tokenId`: The token ID
-
-**Returns**: Either the real URI if caller is authorized or a placeholder URI
-
-**Access**: Public view
-
-### getPrivateTokenURI
-
-```solidity
-function getPrivateTokenURI(uint256 tokenId, string memory accessKey) external view returns (string memory)
-```
-
-**Purpose**: Gets the real URI for a token with proper authorization.
-
-**Parameters**:
-- `tokenId`: The token ID
-- `accessKey`: The access key (optional)
-
-**Returns**: The real URI if authorized
-
-**Access**: External view
-
-### generateSignedAccessURL
-
-```solidity
-function generateSignedAccessURL(uint256 tokenId, uint256 expiration) external view onlyRole(ADMIN_ROLE) returns (string memory signedUrl)
-```
-
-**Purpose**: Web2 controller function to generate a signed access URL.
-
-**Parameters**:
-- `tokenId`: The token ID
-- `expiration`: Timestamp when the access expires
-
-**Returns**: The signed access URL for the Web2 frontend
-
-**Access**: ADMIN_ROLE
-
-## Payment Functions
-
-### payWithBDC
-
-```solidity
-function payWithBDC(uint256 amount, address recipient) external whenNotPaused nonReentrant onlyRole(AUTONOMOUS_ROLE)
-```
-
-**Purpose**: Processes a payment with BDC tokens.
-
-**Parameters**:
-- `amount`: The amount to transfer
-- `recipient`: The recipient's address
-
-**Access**: AUTONOMOUS_ROLE
-
-## View Functions
-
-### getBead
-
-```solidity
-function getBead(string memory beadId) external view returns (Bead memory)
-```
-
-**Purpose**: Returns all information about a specific bead.
-
-**Parameters**:
-- `beadId`: The bead ID
-
-**Returns**: The bead struct
-
-**Access**: External view
-
-### getBeadIdByTokenId
-
-```solidity
-function getBeadIdByTokenId(uint256 tokenId) external view returns (string memory)
-```
-
-**Purpose**: Returns the bead ID associated with an NFT token ID.
-
-**Parameters**:
-- `tokenId`: The token ID
-
-**Returns**: The bead ID
-
-**Access**: External view
-
-### getBeadURIs
-
-```solidity
-function getBeadURIs(string memory beadId) external view returns (string[] memory)
-```
-
-**Purpose**: Returns all URIs associated with a bead.
-
-**Parameters**:
-- `beadId`: The bead ID
-
-**Returns**: Array of URIs
-
-**Access**: External view
-
-### totalSupply
-
-```solidity
-function totalSupply() external view returns (uint256)
-```
-
-**Purpose**: Returns the total number of minted NFTs.
-
-**Returns**: The total supply
-
-**Access**: External view
-
-## Helper Functions
-
-### stringToBytes32
-
-```solidity
-function stringToBytes32(string memory source) internal pure returns (bytes32 result)
-```
-
-**Purpose**: Converts a string to bytes32 for gas optimization.
-
-**Parameters**:
-- `source`: The string to convert
-
-**Returns**: The bytes32 representation
-
-**Access**: Internal pure
-
-### toAsciiString
-
-```solidity
-function toAsciiString(address addr) internal pure returns (string memory)
-```
-
-**Purpose**: Converts an address to ASCII string.
-
-**Parameters**:
-- `addr`: The address to convert
-
-**Returns**: The ASCII string representation
-
-**Access**: Internal pure
-
-### toString
-
-```solidity
-function toString(uint256 value) internal pure returns (string memory)
-```
-
-**Purpose**: Converts a uint to string.
-
-**Parameters**:
-- `value`: The uint to convert
-
-**Returns**: The string representation
-
-**Access**: Internal pure
-
-### toHexString
-
-```solidity
-function toHexString(uint256 value) internal pure returns (string memory)
-```
-
-**Purpose**: Converts a bytes32 to hex string.
-
-**Parameters**:
-- `value`: The bytes32 to convert
-
-**Returns**: The hex string representation
-
-**Access**: Internal pure
+_Last updated: April 2025_
